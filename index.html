@@ -6544,7 +6544,9 @@ function initShaderUI(){
    - 同期: ブロック変更 / プレイヤー(位置・向き・腕振り・スキン・名前) / モブ / チェスト・かまど / 時刻 / チャット / 爆発
    ===================================================================== */
 const _setB=setB,_genChunk=genChunk,_spawnItem=spawnItem,_spawnMob=spawnMob,_closeGUI=closeContainerGUI,_applyI18n=applyI18n;
-const NET_ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]};
+/* TURNを使う場合は NET_TURN に { urls:'turn:...', username:'...', credential:'...' } を追加(厳しいNAT/携帯回線同士だとSTUNだけでは繋がらないことがある) */
+const NET_TURN=[];
+const NET_ICE={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'},...NET_TURN]};
 const _n=(v,d)=>{v=+v;return isFinite(v)?v:(d||0)},_r2=v=>Math.round(v*100)/100;
 const netCleanName=s=>String(s==null?'':s).replace(/[\u0000-\u001f<>]/g,'').trim().slice(0,16)||'Player';
 try{net.name=netCleanName(localStorage.getItem('voxelcraft_mpname')||('Player'+(100+((Math.random()*900)|0))))}catch(e){net.name='Player'+(100+((Math.random()*900)|0))}
@@ -6605,10 +6607,11 @@ function netOnClose(p){
     mpRender()}}
 
 /* ---------- 接続の開始 (ホスト招待 / ゲスト参加) ---------- */
-async function netHostInvite(){
+async function netHostInvite(keep){
   if(net.role==='guest')throw new Error('guest');
   if(!net.role)net.role='host';
-  for(const q of net.invites){q.closed=true;try{q.pc.close()}catch(e){}}net.invites=[];
+  if(!keep){for(const q of net.invites){q.closed=true;try{q.pc.close()}catch(e){}}net.invites=[]}
+  else while(net.invites.length>=8){const q=net.invites.shift();q.closed=true;try{q.pc.close()}catch(e){}}
   const p=netMakePeer();p.pc=new RTCPeerConnection(NET_ICE);netChannels(p);net.invites.push(p);
   await p.pc.setLocalDescription(await p.pc.createOffer());await netGather(p.pc);
   p.code=await netPack({t:'offer',sdp:p.pc.localDescription.sdp});net.cur=p;return p}
@@ -6987,75 +6990,197 @@ function mpRender(){
   else if(net.role==='host'||G.started){names.push('● '+net.name+L(' (ホスト/あなた)',' (host / you)'))}
   for(const p of net.players.values())if(!(net.role==='guest'&&p.id===0))names.push('● '+p.name);
   $('mpRoster').textContent=net.role?(L('参加中のプレイヤー: ','Players: ')+names.length+'\n'+names.join('\n')):''}
-/* ---------- URL共有で参加 (PeerJS公開ブローカーを「招待/返信コードの受け渡し」だけに使う) ----------
-   ホスト: URLを作成 → 友達に送る。ゲスト: URLを開くだけで自動参加。ゲームのデータ自体は従来どおりWebRTCで直接やり取りする */
-const NET_PEERJS_URLS=['https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js','https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js'];
+/* ---------- URL共有で参加 (シグナリングは「PeerJS公開サーバー」と「ntfy.sh」を並行して使う) ----------
+   ホスト: URLを作成 → 友達に送る。ゲスト: URLを開くだけで自動参加。
+   どちらか一方の公開サーバーが落ちていても、もう一方で接続できる。ゲームのデータ自体は従来どおりWebRTCで直接やり取りする */
+const NET_PEERJS_URLS=['https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js','https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js','https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js'];
+const NET_NTFY='https://ntfy.sh/';
 const netPeerCtor=()=>window.Peer||(window.peerjs&&window.peerjs.Peer);
-function netLoadPeerJS(){return new Promise((res,rej)=>{
-  if(netPeerCtor())return res();let i=0;
-  const next=()=>{if(i>=NET_PEERJS_URLS.length)return rej(new Error(L('PeerJSを読み込めません。ネット接続を確認してください','Cannot load PeerJS. Check your connection')));
-    const sc=document.createElement('script');sc.src=NET_PEERJS_URLS[i++];sc.onload=()=>netPeerCtor()?res():next();sc.onerror=next;document.head.appendChild(sc)};
-  next()})}
-const netUrlSt={peer:null,q:Promise.resolve(),url:'',guest:null};
+const netSleep=ms=>new Promise(r=>setTimeout(r,ms));
+const netRnd=n=>Array.from(crypto.getRandomValues(new Uint8Array(n)),b=>(b%36).toString(36)).join('');
+let _netPjsLoad=null;
+function netLoadPeerJS(){
+  if(netPeerCtor())return Promise.resolve();
+  if(_netPjsLoad)return _netPjsLoad;
+  _netPjsLoad=new Promise((res,rej)=>{let i=0;
+    const next=()=>{if(i>=NET_PEERJS_URLS.length){_netPjsLoad=null;return rej(new Error(L('PeerJSを読み込めません','Cannot load PeerJS')))}
+      const sc=document.createElement('script');let t=0,dn=false;
+      const go=ok=>{if(dn)return;dn=true;clearTimeout(t);if(ok&&netPeerCtor())res();else{try{sc.remove()}catch(e){}next()}};
+      sc.src=NET_PEERJS_URLS[i++];sc.onload=()=>go(true);sc.onerror=()=>go(false);t=setTimeout(()=>go(false),10000);document.head.appendChild(sc)};
+    next()});
+  return _netPjsLoad}
+function netEmitter(o){const h={};o.on=(e,f)=>{(h[e]=h[e]||[]).push(f);return o};o.emit=(e,...a)=>{for(const f of(h[e]||[]).slice()){try{f(...a)}catch(x){console.warn('net evt',x)}}};return o}
+async function netNtfyPost(topic,text){
+  let last;
+  for(let i=0;i<3;i++){
+    try{const r=await fetch(NET_NTFY+topic,{method:'POST',body:text,cache:'no-store'});if(r.ok)return;
+      last=new Error('ntfy HTTP '+r.status);if(r.status!==429&&r.status<500)break}
+    catch(e){last=e}
+    await netSleep(600*(i+1))}
+  throw last}
+/* ntfy.sh (HTTP pub/sub) を PeerJS の Peer / DataConnection と同じ最小APIで使えるようにしたもの */
+class NtfyConn{
+  constructor(peer,rid){netEmitter(this);this.peer=peer;this.peerId=rid;this.open=false;this.closed=false}
+  _open(){if(this.open||this.closed)return;this.open=true;this.emit('open')}
+  send(d){
+    if(this.closed)return;
+    const body=JSON.stringify({f:this.peer.id,to:this.peerId,d});
+    if(body.length>3900){this.emit('error',new Error('signal too large'));return}
+    netNtfyPost(this.peer.topic,body).catch(e=>this.emit('error',e))}
+  close(){if(this.closed)return;this.closed=true;if(this.peer.conns.get(this.peerId)===this)this.peer.conns.delete(this.peerId);this.emit('close')}}
+class NtfyPeer{
+  constructor(id){
+    netEmitter(this);this.host=!!id;this.id=id||('g'+netRnd(10));this.topic=id?'vcsig-'+id:null;
+    this.destroyed=false;this.disconnected=false;this.conns=new Map();this.es=null;this.opened=false;
+    if(this.host)this._sub();else setTimeout(()=>{if(!this.destroyed)this.emit('open',this.id)},0)}
+  _sub(){
+    if(this.destroyed||!this.topic)return;
+    try{if(this.es)this.es.close()}catch(e){}
+    let es;try{es=new EventSource(NET_NTFY+this.topic+'/sse')}catch(e){this.emit('error',{type:'network',message:String(e)});return}
+    this.es=es;
+    es.onopen=()=>{if(this.destroyed||this.es!==es)return;this.disconnected=false;this.opened=true;for(const c of this.conns.values())c._open();this.emit('open',this.id)};
+    es.onerror=()=>{
+      if(this.destroyed||this.es!==es)return;
+      this.disconnected=true;this.emit('disconnected');
+      if(es.readyState===2){this.emit('error',{type:'network',message:'ntfy stream closed'});setTimeout(()=>this._sub(),3000)}};
+    es.onmessage=ev=>this._rx(ev.data)}
+  _rx(raw){
+    let ev,m;try{ev=JSON.parse(raw);if(ev.event&&ev.event!=='message')return;m=JSON.parse(ev.message)}catch(e){return}
+    if(!m||m.to!==this.id)return;
+    const from=String(m.f||'').slice(0,40);if(!from)return;
+    let c=this.conns.get(from);
+    if(!c){if(!this.host)return;c=new NtfyConn(this,from);c.open=true;this.conns.set(from,c);this.emit('connection',c)}
+    c.emit('data',m.d)}
+  connect(rid){
+    this.topic='vcsig-'+String(rid);
+    const c=new NtfyConn(this,String(rid));this.conns.set(c.peerId,c);this._sub();return c}
+  reconnect(){if(!this.destroyed&&(!this.es||this.es.readyState===2))this._sub()}
+  destroy(){if(this.destroyed)return;this.destroyed=true;try{if(this.es)this.es.close()}catch(e){}for(const c of[...this.conns.values()])c.close();this.conns.clear()}}
+const NET_SIG=[
+  {name:'PeerJS',load:netLoadPeerJS,make:id=>{const P=netPeerCtor();return new P(id,{debug:0,config:NET_ICE})}},
+  {name:'ntfy',make:id=>new NtfyPeer(id)}];
+const netUrlSt={hosts:null,gpeers:null,q:Promise.resolve(),url:'',named:false,keep:false,watch:0,bySid:new Map()};
 const netNameId=n=>'vcn-'+netHash(String(n||'').normalize('NFKC').trim().toLowerCase());
 function netUrlClose(force){
   if(netUrlSt.keep&&!force)return;
-  for(const k of['peer','guest']){const x=netUrlSt[k];if(x){try{x.destroy()}catch(e){}netUrlSt[k]=null}}
-  netUrlSt.url='';netUrlSt.named=false;netUrlSt.q=Promise.resolve()}
+  for(const e of netUrlSt.hosts||[]){try{e.peer&&e.peer.destroy()}catch(x){}}
+  netUrlSt.hosts=null;
+  for(const x of netUrlSt.gpeers||[]){try{x.destroy()}catch(e){}}
+  netUrlSt.gpeers=null;
+  if(netUrlSt.watch){clearInterval(netUrlSt.watch);netUrlSt.watch=0}
+  netUrlSt.url='';netUrlSt.named=false;netUrlSt.q=Promise.resolve();netUrlSt.bySid.clear()}
+function netSigSummary(){const h=netUrlSt.hosts;if(!h)return'';return' ['+h.map(e=>e.b.name+(e.up?' ✓':(e.err?' ✗':' …'))).join(' / ')+']'}
+/* ---------- ホスト側: 受付 ---------- */
 function netUrlHandle(conn){
-  return new Promise(res=>{
-    let p=null,done=false;
-    const fin=()=>{if(done)return;done=true;try{conn.close()}catch(e){}res()};
-    setTimeout(fin,120000);conn.on('close',fin);conn.on('error',fin);
-    conn.on('data',async d=>{
-      if(!d||typeof d!=='object')return;
-      if(d.t==='need'&&!p){
-        try{if(net.peers.size>=7){conn.send({t:'full'});setTimeout(fin,500);return}
-          if(netUrlSt.named){const who=netCleanName(d.name||'');
-            if(!confirm(L('「'+who+'」さんから通信要求が来ています。マルチプレイに参加させますか？','"'+who+'" wants to join your multiplayer game. Accept?'))){conn.send({t:'deny'});setTimeout(fin,500);return}}
-          p=await netHostInvite();conn.send({t:'offer',code:p.code})}catch(e){console.warn('url offer',e);fin()}}
-      else if(d.t==='answer'&&p&&typeof d.code==='string'&&d.code.length<30000){
-        try{await netHostAccept(p,d.code)}catch(e){console.warn('url answer',e)}setTimeout(fin,2000)}})})}
+  let p=null,done=false;
+  const fin=()=>{if(done)return;done=true;try{conn.close()}catch(e){}};
+  setTimeout(fin,120000);conn.on('close',fin);conn.on('error',fin);
+  const need=async d=>{
+    if(net.peers.size>=7){conn.send({t:'full'});setTimeout(fin,500);return}
+    const sid=String(d.sid||'').replace(/[^\w-]/g,'').slice(0,40)||('x'+netRnd(8));
+    let pr=netUrlSt.bySid.get(sid);
+    if(!pr){
+      pr=(async()=>{
+        if(netUrlSt.named){const who=netCleanName(d.name||'');
+          if(!confirm(L('「'+who+'」さんから通信要求が来ています。マルチプレイに参加させますか？','"'+who+'" wants to join your multiplayer game. Accept?')))return'deny'}
+        const q=await netHostInvite(true);
+        setTimeout(()=>{if(!q.joined&&!q.closed&&net.invites.includes(q)){q.closed=true;try{q.pc.close()}catch(e){}net.invites=net.invites.filter(x=>x!==q)}},180000);
+        return q})();
+      netUrlSt.bySid.set(sid,pr);setTimeout(()=>netUrlSt.bySid.delete(sid),180000);
+      pr.catch(()=>netUrlSt.bySid.delete(sid))}
+    const r=await pr;
+    if(r==='deny'){conn.send({t:'deny'});setTimeout(fin,500);return}
+    p=r;conn.send({t:'offer',code:p.code})};
+  conn.on('data',async d=>{
+    if(!d||typeof d!=='object')return;
+    if(d.t==='need'&&!p){try{await need(d)}catch(e){console.warn('url offer',e);fin()}}
+    else if(d.t==='answer'&&p&&!p.accepted&&typeof d.code==='string'&&d.code.length<30000){
+      p.accepted=true;
+      try{await netHostAccept(p,d.code)}catch(e){p.accepted=false;console.warn('url answer',e)}
+      setTimeout(fin,2000)}})}
+function netSigMakeHost(e){
+  e.last=Date.now();
+  let pr;
+  try{pr=e.b.make(e.id)}catch(x){e.err=x;if(e.fail)e.fail(x);return null}
+  pr.on('open',()=>{e.up=true;e.err=null;if(e.ok)e.ok()});
+  pr.on('error',x=>{e.up=false;e.err=x||new Error('error');if(e.fail)e.fail(x)});
+  pr.on('connection',c=>netUrlHandle(c));
+  pr.on('disconnected',()=>{e.up=false;setTimeout(()=>{try{if(!pr.destroyed)pr.reconnect()}catch(x){}},1500)});
+  return pr}
+/* タブが裏に回るとタイマーが止まりサーバーから切断されるので、定期監視+復帰時に再接続する */
+function netSigWatch(){
+  if(netUrlSt.watch)return;
+  const tick=()=>{for(const e of netUrlSt.hosts||[]){
+    try{
+      if(!e.peer||e.peer.destroyed){if(Date.now()-(e.last||0)>10000)(async()=>{try{if(e.b.load)await e.b.load();e.peer=netSigMakeHost(e)}catch(x){}})()}
+      else if(e.peer.disconnected)e.peer.reconnect()
+    }catch(x){}}};
+  netUrlSt.watch=setInterval(tick,5000);
+  if(!netSigWatch.v){netSigWatch.v=1;document.addEventListener('visibilitychange',()=>{if(!document.hidden&&netUrlSt.hosts)for(const e of netUrlSt.hosts){try{if(e.peer&&e.peer.disconnected)e.peer.reconnect()}catch(x){}}})}}
 async function netUrlHost(named){
   if(net.role==='guest')throw new Error(L('参加中はURLを作成できません','Cannot create a URL while joined'));
   if(!named&&location.protocol==='file:')throw new Error(L('このHTMLをWebに公開(GitHub Pagesなど)したURLで開いている必要があります。file:// では共有URLを作れません','Open this game from a web URL (e.g. GitHub Pages). A file:// page cannot make a shareable URL'));
-  if(netUrlSt.peer&&netUrlSt.url){if(!!netUrlSt.named===!!named)return netUrlSt.url;netUrlClose(true)}
-  await netLoadPeerJS();
-  const id=named?netNameId(net.name):'vc'+Array.from(crypto.getRandomValues(new Uint8Array(9)),b=>(b%36).toString(36)).join('');
+  if(netUrlSt.hosts&&netUrlSt.url){if(!!netUrlSt.named===!!named)return netUrlSt.url;netUrlClose(true)}
+  const id=named?netNameId(net.name):'vc'+netRnd(9);
   netUrlSt.named=!!named;
-  const P=netPeerCtor();
+  const hosts=netUrlSt.hosts=NET_SIG.map(b=>({b,id,peer:null,up:false,err:null,last:0,failed:false}));
   await new Promise((res,rej)=>{
-    const pr=new P(id);netUrlSt.peer=pr;const to=setTimeout(()=>rej(new Error(L('シグナリングサーバーに接続できません','Cannot reach the signaling server'))),15000);
-    pr.on('open',()=>{clearTimeout(to);res()});
-    pr.on('error',e=>{clearTimeout(to);rej(new Error(e&&e.type==='unavailable-id'?L('その名前は既に誰かが待機中です。名前を変えてください','That name is already waiting somewhere. Change your name'):((e&&e.type)||String(e))))});
-    pr.on('connection',c=>{netUrlSt.q=netUrlSt.q.then(()=>netUrlHandle(c)).catch(()=>{})});
-    pr.on('disconnected',()=>{try{pr.reconnect()}catch(e){}})});
+    let pend=hosts.length;
+    const to=setTimeout(()=>rej(new Error(L('シグナリングサーバーに接続できません(PeerJS / ntfy とも応答なし。ネットワークを確認してください)','Cannot reach any signaling server (PeerJS / ntfy). Check your network'))),15000);
+    for(const e of hosts){
+      e.ok=()=>{clearTimeout(to);res()};
+      e.fail=x=>{
+        if(x&&x.type==='unavailable-id'){clearTimeout(to);return rej(new Error(L('その名前は既に誰かが待機中です。名前を変えてください','That name is already waiting somewhere. Change your name')))}
+        if(e.failed)return;e.failed=true;
+        if(--pend<=0){clearTimeout(to);rej(new Error(L('シグナリングサーバーに接続できません','Cannot reach the signaling server')+' ('+((x&&(x.type||x.message))||'error')+')'))}};
+      (async()=>{try{if(e.b.load)await e.b.load()}catch(x){e.fail(x);return}e.peer=netSigMakeHost(e)})()}
+  }).catch(err=>{netUrlClose(true);throw err});
+  netSigWatch();
   if(!net.role)net.role='host';
   netUrlSt.url=named?('name:'+net.name):(location.href.split('#')[0]+'#join='+id);return netUrlSt.url}
+/* ---------- ゲスト側: 全バックエンドへ並行して問い合わせ、最初に返ってきた招待で接続 ---------- */
 async function netUrlJoin(id,named){
   if(net.role==='host')throw new Error(L('ホスト中は参加できません','Cannot join while hosting'));
   id=String(id||'').replace(/[^\w-]/g,'').slice(0,60);if(!id)throw new Error(L('URLが正しくありません','Invalid URL'));
   net.status=L('ホストを探しています…','Looking for the host…');mpRender();
-  await netLoadPeerJS();
   netUrlClose(true);
-  const P=netPeerCtor(),pr=new P();netUrlSt.guest=pr;
-  const fail=e=>{const m=(e&&e.message)||String(e);net.status=L('エラー: ','Error: ')+m;mpRender()};
-  await new Promise((res,rej)=>{const to=setTimeout(()=>rej(new Error(L('シグナリングサーバーに接続できません','Cannot reach the signaling server'))),15000);
-    pr.on('open',()=>{clearTimeout(to);res()});pr.on('error',e=>{clearTimeout(to);rej(e)})});
-  const conn=pr.connect(id,{reliable:true});
-  const to=setTimeout(()=>{if(net.status&&!net.hostPeer){fail(new Error(L('ホストが見つかりません(ホストがオンラインか確認してください)','Host not found (is the host online?)')));netUrlClose()}},named?100000:25000);
-  pr.on('error',e=>{clearTimeout(to);fail(new Error(e&&e.type==='peer-unavailable'?(named?L('その名前の待機中プレイヤーが見つかりません(名前の綴りと、相手が待機中か確認してください)','No player is waiting under that name'):L('ホストが見つかりません(URLが古いか、ホストがオフラインです)','Host not found (stale URL or host offline)')):((e&&e.type)||String(e))));netUrlClose()});
-  conn.on('open',()=>{net.status=named?L('通信要求を送りました。相手が承認するのを待っています…','Request sent. Waiting for the host to accept…'):L('ホストに接続中…','Contacting host…');mpRender();conn.send({t:'need',name:net.name})});
-  conn.on('data',async d=>{
-    if(!d||typeof d!=='object')return;
-    if(d.t==='deny'){clearTimeout(to);fail(new Error(L('相手に断られました','The host declined')));netUrlClose();return}
-    if(d.t==='full'){clearTimeout(to);fail(new Error(L('ホストが満員です','The host is full')));netUrlClose();return}
-    if(d.t==='offer'&&typeof d.code==='string'){
-      try{netUrlSt.keep=true;let ans;try{ans=await netJoin(d.code)}finally{netUrlSt.keep=false}clearTimeout(to);conn.send({t:'answer',code:ans});
+  const sid=netRnd(10),gp=netUrlSt.gpeers=[];
+  let won=null,over=false,reached=0,alive=NET_SIG.length,to=0;
+  const unreach=()=>L('シグナリングサーバーに接続できません(PeerJS / ntfy とも応答なし)','Cannot reach any signaling server (PeerJS / ntfy)');
+  const notFound=()=>named?L('その名前の待機中プレイヤーが見つかりません(名前の綴りと、相手が待機中か確認してください)','No player is waiting under that name'):L('ホストが見つかりません(URLが古いか、ホストがオフライン/タブが裏に回って切断された可能性があります。ホストにURLを作り直してもらってください)','Host not found (stale URL, or the host is offline / its tab was in the background. Ask the host to recreate the URL)');
+  const fail=e=>{if(over)return;over=true;clearTimeout(to);const m=(e&&e.message)||String(e);net.status=L('エラー: ','Error: ')+m;mpRender();netUrlClose(true)};
+  const giveUp=()=>{if(won||over)return;if(--alive<=0)fail(new Error(reached?notFound():unreach()))};
+  to=setTimeout(()=>{if(!won&&!over)fail(new Error(reached?notFound():unreach()))},named?100000:30000);
+  const onData=async(pr,conn,d)=>{
+    if(!d||typeof d!=='object'||over)return;
+    if(won&&won!==conn)return;
+    if(d.t==='deny'){fail(new Error(L('相手に断られました','The host declined')));return}
+    if(d.t==='full'){fail(new Error(L('ホストが満員です','The host is full')));return}
+    if(d.t==='offer'&&typeof d.code==='string'&&!won){
+      won=conn;clearTimeout(to);
+      for(const x of gp.slice())if(x!==pr){try{x.destroy()}catch(e){}}
+      gp.length=0;gp.push(pr);
+      try{netUrlSt.keep=true;let ans;try{ans=await netJoin(d.code)}finally{netUrlSt.keep=false}
+        conn.send({t:'answer',code:ans});
         net.status=L('接続しています…','Connecting…');mpRender();
-        setTimeout(()=>{if(net.role==='guest'&&!net.welcome)net.status=L('接続に失敗する場合は、ホストにURLを作り直してもらってください','If this fails, ask the host to recreate the URL');mpRender()},20000);
+        setTimeout(()=>{if(net.role==='guest'&&!net.welcome){net.status=L('接続に失敗する場合は、ホストにURLを作り直してもらってください','If this fails, ask the host to recreate the URL');mpRender()}},20000);
         setTimeout(()=>netUrlClose(true),90000)}
-      catch(e){clearTimeout(to);fail(e);netUrlClose()}}})}
+      catch(e){fail(e)}}};
+  const start=async b=>{
+    let pr=null,gave=false,seen=false;
+    const bail=()=>{if(gave)return;gave=true;giveUp()};
+    try{if(b.load)await b.load();if(over)return;pr=b.make()}catch(x){bail();return}
+    gp.push(pr);
+    pr.on('error',bail);
+    pr.on('open',()=>{
+      if(seen||won||over)return;seen=true;reached++;
+      const conn=pr.connect(id,{reliable:true});
+      conn.on('open',()=>{if(won||over)return;
+        net.status=named?L('通信要求を送りました。相手が承認するのを待っています…','Request sent. Waiting for the host to accept…'):L('ホストに接続中…','Contacting host…');mpRender();
+        conn.send({t:'need',name:net.name,sid})});
+      conn.on('error',bail);
+      conn.on('data',d=>onData(pr,conn,d))})};
+  for(const b of NET_SIG)start(b)}
 function netUrlFromText(t){const m=/[#&?]join=([\w-]+)/.exec(String(t||''));return m?m[1]:null}
 function netUrlAutoJoin(){
   const id=netUrlFromText(location.hash);if(!id)return;
@@ -7069,7 +7194,7 @@ function netUrlBuildUI(){
   $('btnMpUrl').onclick=async()=>{
     try{net.status=L('共有URLを作成中…','Creating share URL…');mpRender();
       const u=await netUrlHost();$('mpUrl').value=u;
-      net.status=L('このURLを友達に送るだけでOKです。友達がURLを開くと自動で参加します','Just send this URL to friends. They join automatically when they open it');mpRender()}
+      net.status=L('このURLを友達に送るだけでOKです。友達がURLを開くと自動で参加します(このタブは開いたままにしてください)','Just send this URL to friends. They join automatically when they open it (keep this tab open)')+netSigSummary();mpRender()}
     catch(e){net.status=L('エラー: ','Error: ')+(e&&e.message||e);mpRender()}};
   $('btnMpCopyUrl').onclick=()=>mpCopy('mpUrl');
   $('btnMpWait').onclick=async()=>{
